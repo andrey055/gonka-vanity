@@ -2,6 +2,8 @@ package main
 
 import (
 	"testing"
+	"time"
+	"sync/atomic"
 
 	"github.com/stretchr/testify/require"
 )
@@ -44,10 +46,41 @@ func TestDigits(t *testing.T) {
 	require.False(t, m.Match("gonka1j666m3qz66t786s48t540536465p56zrve589z"))
 }
 
+func TestMatchIsOR(t *testing.T) {
+	// NOTE: These tests assert the new behavior: enabled matchers are combined with OR.
+	m := matcher{Prefix: "nope", Contains: "k2k2k"}
+	ok, matched := m.MatchDetailed("gonka1s6rlmknaj3swdd7hua6s852sk2k2k409a3z9f9")
+	require.True(t, ok)
+	require.Contains(t, matched, "contains")
+	require.NotContains(t, matched, "prefix")
+}
+
+func TestRepeatMatcher(t *testing.T) {
+	m := matcher{Repeat: 5}
+	ok, matched := m.MatchDetailed("gonka1aaaaaqztg6eu45nlljp0wp947juded46aln83kr")
+	require.True(t, ok)
+	require.Contains(t, matched, "repeat")
+}
+
+func TestValidationRequiresAtLeastOneMatcher(t *testing.T) {
+	m := matcher{}
+	errs := m.ValidationErrors()
+	require.NotEmpty(t, errs)
+}
+
 func TestFindMatchingWalletConcurrent(t *testing.T) {
 	goroutineCount := 5
 	lastChars := "zz"
 	m := matcher{Suffix: lastChars}
-	w := findMatchingWalletConcurrent(m, goroutineCount)
-	require.Equal(t, w.Address[len(w.Address)-len(lastChars):], lastChars, "Incorrect address suffix")
+
+	startedAt := time.Now()
+	var attempts uint64
+	quit := make(chan struct{})
+	defer close(quit)
+
+	_ = atomic.LoadUint64(&attempts)
+	res := findMatchingWalletConcurrent(m, goroutineCount, quit, &attempts, startedAt)
+	require.Equal(t, res.Wallet.Address[len(res.Wallet.Address)-len(lastChars):], lastChars, "Incorrect address suffix")
+	require.Greater(t, res.Attempts, uint64(0))
+	require.GreaterOrEqual(t, int(res.Elapsed), 0)
 }
