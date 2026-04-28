@@ -1,4 +1,4 @@
-module github.com/hukkinj1/cosmosvanity
+module github.com/andrey055/gonka-vanity
 
 go 1.17
 

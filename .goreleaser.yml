@@ -13,6 +13,7 @@ builds:
 - env:
   # Goreleaser doesnt support CGO
   - CGO_ENABLED=0
+  binary: gonka-vanity
   goos:
   - linux
   - darwin

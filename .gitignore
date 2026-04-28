@@ -15,7 +15,7 @@
 # vendor/
 
 # Ignore the result of `go build`
-cosmosvanity
+gonka-vanity
 
 # coverage file of `go test`
 coverage.txt
