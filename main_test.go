@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 	"sync/atomic"
+	"strings"
 
 	"github.com/stretchr/testify/require"
 )
@@ -62,6 +63,20 @@ func TestRepeatMatcher(t *testing.T) {
 	require.Contains(t, matched, "repeat")
 }
 
+func TestRepeatPrefixMatcher(t *testing.T) {
+	m := matcher{RepeatPrefix: 5}
+	ok, matched := m.MatchDetailed("gonka1aaaaaqztg6eu45nlljp0wp947juded46aln83kr")
+	require.True(t, ok)
+	require.Contains(t, matched, "repeat-prefix")
+}
+
+func TestRepeatSuffixMatcher(t *testing.T) {
+	m := matcher{RepeatSuffix: 5}
+	ok, matched := m.MatchDetailed("gonka1ku3umy7rpqvqd7j9z5zdsxy50599999aj2r0nt")
+	require.True(t, ok)
+	require.Contains(t, matched, "repeat-suffix")
+}
+
 func TestValidationRequiresAtLeastOneMatcher(t *testing.T) {
 	m := matcher{}
 	errs := m.ValidationErrors()
@@ -78,9 +93,30 @@ func TestFindMatchingWalletConcurrent(t *testing.T) {
 	quit := make(chan struct{})
 	defer close(quit)
 
+	gen := func() (wallet, error) {
+		return generateWallet(), nil
+	}
 	_ = atomic.LoadUint64(&attempts)
-	res := findMatchingWalletConcurrent(m, goroutineCount, quit, &attempts, startedAt)
+	res := findMatchingWalletConcurrent(m, goroutineCount, quit, &attempts, startedAt, gen)
 	require.Equal(t, res.Wallet.Address[len(res.Wallet.Address)-len(lastChars):], lastChars, "Incorrect address suffix")
 	require.Greater(t, res.Attempts, uint64(0))
 	require.GreaterOrEqual(t, int(res.Elapsed), 0)
+}
+
+func TestMnemonicDerivationIsDeterministic(t *testing.T) {
+	// NOTE: Same mnemonic + same path must always derive the same address and private key bytes.
+	mnemonic := "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+	path := "m/44'/1200'/0'/0/0"
+
+	w1, err := deriveWalletFromMnemonic(mnemonic, path)
+	require.NoError(t, err)
+	w2, err := deriveWalletFromMnemonic(mnemonic, path)
+	require.NoError(t, err)
+
+	require.Equal(t, w1.Address, w2.Address)
+	require.Equal(t, w1.Privkey, w2.Privkey)
+	require.Equal(t, w1.Pubkey, w2.Pubkey)
+	require.Equal(t, w1.DerivationPath, w2.DerivationPath)
+	require.Equal(t, w1.Mnemonic, w2.Mnemonic)
+	require.True(t, strings.HasPrefix(w1.Address, "gonka1"))
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -11,7 +12,10 @@ import (
 
 	flag "github.com/spf13/pflag"
 
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcutil/hdkeychain"
 	"github.com/cosmos/cosmos-sdk/types/bech32"
+	"github.com/cosmos/go-bip39"
 	"github.com/tendermint/tendermint/crypto/secp256k1"
 )
 
@@ -22,10 +26,14 @@ type matcher struct {
 	Letters  int
 	Digits   int
 	Repeat   int
+	RepeatPrefix int
+	RepeatSuffix int
 }
 
 func (m matcher) anyRuleProvided() bool {
-	return m.Prefix != "" || m.Suffix != "" || m.Contains != "" || m.Repeat > 0 || m.Digits > 0 || m.Letters > 0
+	return m.Prefix != "" || m.Suffix != "" || m.Contains != "" ||
+		m.Repeat > 0 || m.RepeatPrefix > 0 || m.RepeatSuffix > 0 ||
+		m.Digits > 0 || m.Letters > 0
 }
 
 func (m matcher) matchPayload(candidate string) string {
@@ -51,6 +59,12 @@ func (m matcher) MatchDetailed(candidate string) (bool, []string) {
 	}
 	if m.Repeat > 0 && hasRepeatedRun(payload, m.Repeat) {
 		matched = append(matched, "repeat")
+	}
+	if m.RepeatPrefix > 0 && hasRepeatedPrefix(payload, m.RepeatPrefix) {
+		matched = append(matched, "repeat-prefix")
+	}
+	if m.RepeatSuffix > 0 && hasRepeatedSuffix(payload, m.RepeatSuffix) {
+		matched = append(matched, "repeat-suffix")
 	}
 	if m.Digits > 0 && countUnionChars(payload, bech32digits) >= m.Digits {
 		matched = append(matched, "digits")
@@ -85,8 +99,20 @@ func (m matcher) ValidationErrors() []string {
 		// A run length of 1 would match every address and is almost certainly a user mistake.
 		errs = append(errs, "ERROR: --repeat must be 2 or more")
 	}
+	if m.RepeatPrefix < 0 {
+		errs = append(errs, "ERROR: --repeat-prefix can't be negative")
+	}
+	if m.RepeatPrefix == 1 {
+		errs = append(errs, "ERROR: --repeat-prefix must be 2 or more")
+	}
+	if m.RepeatSuffix < 0 {
+		errs = append(errs, "ERROR: --repeat-suffix can't be negative")
+	}
+	if m.RepeatSuffix == 1 {
+		errs = append(errs, "ERROR: --repeat-suffix must be 2 or more")
+	}
 	if !m.anyRuleProvided() {
-		errs = append(errs, "ERROR: Please provide at least one matcher: --prefix/--suffix/--contains/--repeat/--digits/--letters")
+		errs = append(errs, "ERROR: Please provide at least one matcher: --prefix/--suffix/--contains/--repeat/--repeat-prefix/--repeat-suffix/--digits/--letters")
 	}
 	if (!bech32Only(m.Contains)) || (!bech32Only(m.Prefix)) || (!bech32Only(m.Suffix)) {
 		errs = append(errs, "ERROR: A provided matcher contains bech32 incompatible characters")
@@ -98,6 +124,10 @@ type wallet struct {
 	Address string
 	Pubkey  []byte
 	Privkey []byte
+	// Mnemonic is optional. It is only set when the wallet was generated from a BIP39 seed phrase.
+	Mnemonic string
+	// DerivationPath is optional. It is only set when Mnemonic is set.
+	DerivationPath string
 }
 
 func (w wallet) String() string {
@@ -114,7 +144,133 @@ func generateWallet() wallet {
 		panic(err)
 	}
 
-	return wallet{bech32Addr, pubkey, privkey}
+	return wallet{Address: bech32Addr, Pubkey: pubkey, Privkey: privkey}
+}
+
+func generateMnemonic(words int) (string, error) {
+	// NOTE: BIP39 word count maps to entropy size: 12 -> 128 bits, 24 -> 256 bits.
+	entropyBits := 0
+	switch words {
+	case 12:
+		entropyBits = 128
+	case 24:
+		entropyBits = 256
+	default:
+		return "", fmt.Errorf("unsupported mnemonic length: %d (use 12 or 24)", words)
+	}
+
+	entropy, err := bip39.NewEntropy(entropyBits)
+	if err != nil {
+		return "", err
+	}
+	return bip39.NewMnemonic(entropy)
+}
+
+func deriveWalletFromMnemonic(mnemonic string, derivationPath string) (wallet, error) {
+	// NOTE:
+	// - We derive the private key using BIP32 (hdkeychain) instead of Cosmos SDK hd helpers.
+	// - This avoids `go mod tidy` resolving dependency test packages that can conflict with
+	//   Tendermint/Cosmos-SDK versioning in older SDK releases.
+	// - Coin type should match Gonka's `inferenced` (1200), so default path is m/44'/1200'/0'/0/0.
+	if !bip39.IsMnemonicValid(mnemonic) {
+		return wallet{}, fmt.Errorf("invalid mnemonic")
+	}
+
+	seed := bip39.NewSeed(mnemonic, "")
+	derivedPrivKeyBytes, err := deriveBIP32PrivateKeyForPath(seed, derivationPath)
+	if err != nil {
+		return wallet{}, err
+	}
+
+	// Tendermint secp256k1 expects 32 bytes.
+	if len(derivedPrivKeyBytes) != 32 {
+		return wallet{}, fmt.Errorf("unexpected derived private key length: %d", len(derivedPrivKeyBytes))
+	}
+
+	priv := secp256k1.PrivKey(derivedPrivKeyBytes)
+	pub := priv.PubKey().(secp256k1.PubKey)
+
+	bech32Addr, err := bech32.ConvertAndEncode("gonka", pub.Address())
+	if err != nil {
+		return wallet{}, err
+	}
+
+	return wallet{
+		Address:        bech32Addr,
+		Pubkey:         pub,
+		Privkey:        priv,
+		Mnemonic:       mnemonic,
+		DerivationPath: derivationPath,
+	}, nil
+}
+
+func generateWalletMnemonic(words int, derivationPath string) (wallet, error) {
+	mn, err := generateMnemonic(words)
+	if err != nil {
+		return wallet{}, err
+	}
+	return deriveWalletFromMnemonic(mn, derivationPath)
+}
+
+func deriveBIP32PrivateKeyForPath(seed []byte, derivationPath string) ([]byte, error) {
+	// NOTE:
+	// - `hdkeychain` is Bitcoin-oriented but implements standard BIP32 derivation which is
+	//   also used for Cosmos-style wallets.
+	// - We use chaincfg.MainNetParams only as a required parameter; it doesn't affect the
+	//   underlying key derivation.
+	//
+	// Expected path format: m/44'/1200'/0'/0/0
+	path := strings.TrimSpace(derivationPath)
+	if path == "" {
+		return nil, fmt.Errorf("empty derivation path")
+	}
+	if !strings.HasPrefix(path, "m/") {
+		return nil, fmt.Errorf("unsupported derivation path (expected to start with \"m/\"): %q", path)
+	}
+	parts := strings.Split(path[2:], "/")
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("invalid derivation path: %q", path)
+	}
+
+	master, err := hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
+	if err != nil {
+		return nil, err
+	}
+
+	key := master
+	for _, p := range parts {
+		if p == "" {
+			return nil, fmt.Errorf("invalid derivation path segment in %q", path)
+		}
+
+		hardened := strings.HasSuffix(p, "'")
+		if hardened {
+			p = strings.TrimSuffix(p, "'")
+		}
+
+		var idx uint32
+		_, err := fmt.Sscanf(p, "%d", &idx)
+		if err != nil {
+			return nil, fmt.Errorf("invalid derivation index %q in %q", p, path)
+		}
+		if hardened {
+			idx = idx + hdkeychain.HardenedKeyStart
+		}
+
+		// NOTE: `hdkeychain` uses Derive() for child keys.
+		key, err = key.Derive(idx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ecPriv, err := key.ECPrivKey()
+	if err != nil {
+		return nil, err
+	}
+
+	// 32-byte serialized secret scalar.
+	return ecPriv.Serialize(), nil
 }
 
 type matchResult struct {
@@ -147,6 +303,51 @@ func hasRepeatedRun(s string, runLen int) bool {
 	return false
 }
 
+func hasRepeatedPrefix(s string, runLen int) bool {
+	// NOTE: Checks if the string starts with runLen identical characters.
+	if runLen <= 1 {
+		return true
+	}
+	if len(s) == 0 {
+		return false
+	}
+
+	// bech32 payload is ASCII; using bytes keeps this fast and simple.
+	b := []byte(s)
+	if len(b) < runLen {
+		return false
+	}
+	first := b[0]
+	for i := 1; i < runLen; i++ {
+		if b[i] != first {
+			return false
+		}
+	}
+	return true
+}
+
+func hasRepeatedSuffix(s string, runLen int) bool {
+	// NOTE: Checks if the string ends with runLen identical characters.
+	if runLen <= 1 {
+		return true
+	}
+	if len(s) == 0 {
+		return false
+	}
+
+	b := []byte(s)
+	if len(b) < runLen {
+		return false
+	}
+	last := b[len(b)-1]
+	for i := 2; i <= runLen; i++ {
+		if b[len(b)-i] != last {
+			return false
+		}
+	}
+	return true
+}
+
 func formatDuration(d time.Duration) string {
 	// NOTE: Stable HH:MM:SS keeps progress/file output easy to read and parse.
 	totalSeconds := int(d.Seconds())
@@ -159,11 +360,138 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
+func clamp01(x float64) float64 {
+	if x < 0 {
+		return 0
+	}
+	if x > 1 {
+		return 1
+	}
+	return x
+}
+
+func pow32(n int) float64 {
+	// NOTE: 32 is the bech32 charset size (excluding the separator '1').
+	// Using math.Pow is fine here; this is used only for ETA estimation, not the hot path.
+	return math.Pow(32.0, float64(n))
+}
+
+func binomialTailProbability(n int, p float64, atLeast int) float64 {
+	// NOTE:
+	// - Computes P(X >= atLeast) for X ~ Binomial(n, p).
+	// - n is small (38 for bech32 payload), so a simple stable iterative PMF is fast enough.
+	if atLeast <= 0 {
+		return 1.0
+	}
+	if atLeast > n {
+		return 0.0
+	}
+	if p <= 0 {
+		return 0.0
+	}
+	if p >= 1 {
+		return 1.0
+	}
+
+	// Compute pmf(k) iteratively from pmf(0) to pmf(n).
+	pmf := math.Pow(1.0-p, float64(n))
+	tail := 0.0
+	for k := 0; k <= n; k++ {
+		if k >= atLeast {
+			tail += pmf
+		}
+		if k == n {
+			break
+		}
+		// pmf(k+1) = pmf(k) * ((n-k)/(k+1)) * (p/(1-p))
+		pmf *= (float64(n-k) / float64(k+1)) * (p / (1.0 - p))
+	}
+	return clamp01(tail)
+}
+
+func estimateSuccessProbability(m matcher) float64 {
+	// NOTE:
+	// - This is an approximation intended for user-facing ETA only.
+	// - We treat enabled matchers as OR and estimate each matcher's probability independently,
+	//   then combine via: p = 1 - Π(1 - p_i).
+	//
+	// Assumptions:
+	// - bech32 payload length for accounts is ~38 chars.
+	// - charset size is 32.
+	const payloadLen = 38
+
+	var probs []float64
+
+	if m.Prefix != "" {
+		probs = append(probs, 1.0/pow32(len(m.Prefix)))
+	}
+	if m.Suffix != "" {
+		probs = append(probs, 1.0/pow32(len(m.Suffix)))
+	}
+	if m.Contains != "" {
+		k := len(m.Contains)
+		if k > 0 && k <= payloadLen {
+			positions := float64(payloadLen - k + 1)
+			// Union bound approximation for "substring occurs anywhere".
+			probs = append(probs, clamp01(positions/pow32(k)))
+		}
+	}
+	if m.Repeat > 0 && m.Repeat <= payloadLen {
+		positions := float64(payloadLen - m.Repeat + 1)
+		// For a fixed start position, probability that next (N-1) chars equal the first is 1/32^(N-1).
+		probs = append(probs, clamp01(positions/pow32(m.Repeat-1)))
+	}
+	if m.RepeatPrefix > 0 && m.RepeatPrefix <= payloadLen {
+		// First N chars all equal: 1/32^(N-1)
+		probs = append(probs, 1.0/pow32(m.RepeatPrefix-1))
+	}
+	if m.RepeatSuffix > 0 && m.RepeatSuffix <= payloadLen {
+		// Last N chars all equal: 1/32^(N-1)
+		probs = append(probs, 1.0/pow32(m.RepeatSuffix-1))
+	}
+	if m.Digits > 0 {
+		// bech32digits = 9 out of 32 chars.
+		probs = append(probs, binomialTailProbability(payloadLen, 9.0/32.0, m.Digits))
+	}
+	if m.Letters > 0 {
+		// bech32letters = 23 out of 32 chars.
+		probs = append(probs, binomialTailProbability(payloadLen, 23.0/32.0, m.Letters))
+	}
+
+	if len(probs) == 0 {
+		return 0.0
+	}
+
+	none := 1.0
+	for _, pi := range probs {
+		none *= (1.0 - clamp01(pi))
+	}
+	return clamp01(1.0 - none)
+}
+
 func writeMatchTXT(f *os.File, res matchResult) error {
 	// NOTE: One line per result (grep-friendly).
 	//
 	// SECURITY WARNING:
 	// - This tool persists private keys. Users MUST protect output files.
+	// NOTE: Keep fields stable and single-line. Mnemonic-related fields are only present
+	// when mnemonic mode is enabled.
+	if res.Wallet.Mnemonic != "" {
+		_, err := fmt.Fprintf(
+			f,
+			"address=%s pubkey=%s privkey=%s mnemonic=%q path=%q matched=%s attempts=%d elapsed=%s\n",
+			res.Wallet.Address,
+			hex.EncodeToString(res.Wallet.Pubkey),
+			hex.EncodeToString(res.Wallet.Privkey),
+			res.Wallet.Mnemonic,
+			res.Wallet.DerivationPath,
+			strings.Join(res.Matched, ","),
+			res.Attempts,
+			formatDuration(res.Elapsed),
+		)
+		return err
+	}
+
 	_, err := fmt.Fprintf(
 		f,
 		"address=%s pubkey=%s privkey=%s matched=%s attempts=%d elapsed=%s\n",
@@ -177,13 +505,20 @@ func writeMatchTXT(f *os.File, res matchResult) error {
 	return err
 }
 
-func findMatchingWallets(ch chan matchResult, quit chan struct{}, m matcher, attempts *uint64, startedAt time.Time) {
+type walletGenerator func() (wallet, error)
+
+func findMatchingWallets(ch chan matchResult, quit chan struct{}, m matcher, attempts *uint64, startedAt time.Time, gen walletGenerator) {
 	for {
 		select {
 		case <-quit:
 			return
 		default:
-			w := generateWallet()
+			w, err := gen()
+			if err != nil {
+				// NOTE: Generator errors should be extremely rare. We skip and continue so the
+				// search keeps running without crashing.
+				continue
+			}
 			curAttempts := atomic.AddUint64(attempts, 1)
 			ok, matched := m.MatchDetailed(w.Address)
 			if ok {
@@ -204,11 +539,11 @@ func findMatchingWallets(ch chan matchResult, quit chan struct{}, m matcher, att
 	}
 }
 
-func findMatchingWalletConcurrent(m matcher, goroutines int, quit chan struct{}, attempts *uint64, startedAt time.Time) matchResult {
+func findMatchingWalletConcurrent(m matcher, goroutines int, quit chan struct{}, attempts *uint64, startedAt time.Time, gen walletGenerator) matchResult {
 	ch := make(chan matchResult)
 
 	for i := 0; i < goroutines; i++ {
-		go findMatchingWallets(ch, quit, m, attempts, startedAt)
+		go findMatchingWallets(ch, quit, m, attempts, startedAt, gen)
 	}
 	return <-ch
 }
@@ -243,8 +578,13 @@ func main() {
 	var letters = flag.IntP("letters", "l", 0, "Match addresses whose payload contains at least this many letters (a-z)")
 	var digits = flag.IntP("digits", "d", 0, "Match addresses whose payload contains at least this many digits (0-9)")
 	var repeat = flag.IntP("repeat", "r", 0, "Minimum length of a repeated-character run that the address must contain (e.g. 5 matches aaaaa / 77777 / qqqqq)")
+	var repeatPrefix = flag.Int("repeat-prefix", 0, "Match addresses whose payload starts with N identical characters (e.g. 5 matches aaaaa / 77777 / qqqqq)")
+	var repeatSuffix = flag.Int("repeat-suffix", 0, "Match addresses whose payload ends with N identical characters (e.g. 5 matches aaaaa / 77777 / qqqqq)")
 	var outPath = flag.String("out", "", "Write found wallets to a local file (TXT)")
 	var outFormat = flag.String("format", "txt", "Output format when using --out (txt)")
+	var useMnemonic = flag.Bool("mnemonic", false, "Generate wallets from BIP39 mnemonic (slower but wallet-friendly)")
+	var mnemonicWords = flag.Int("words", 24, "Mnemonic word count when using --mnemonic (12 or 24)")
+	var derivationPath = flag.String("path", "m/44'/1200'/0'/0/0", "HD derivation path when using --mnemonic")
 	flag.Parse()
 
 	if *walletsToFind < 1 {
@@ -263,6 +603,8 @@ func main() {
 		Letters:  *letters,
 		Digits:   *digits,
 		Repeat:   *repeat,
+		RepeatPrefix: *repeatPrefix,
+		RepeatSuffix: *repeatSuffix,
 	}
 	matcherValidationErrs := m.ValidationErrors()
 	if len(matcherValidationErrs) > 0 {
@@ -274,6 +616,18 @@ func main() {
 
 	startedAt := time.Now()
 	var attempts uint64
+
+	// NOTE:
+	// - Print a one-time approximation for expected attempts and ETA.
+	// - This is best-effort and can be off significantly depending on rule interactions.
+	pSuccess := estimateSuccessProbability(m)
+	var expectedAttempts float64
+	if pSuccess > 0 {
+		expectedAttempts = 1.0 / pSuccess
+	}
+	if expectedAttempts > 0 {
+		fmt.Fprintf(os.Stderr, "Estimated attempts per success: ~%.0f (p≈%.6g)\n", expectedAttempts, pSuccess)
+	}
 
 	var outFile *os.File
 	if *outPath != "" {
@@ -315,7 +669,24 @@ func main() {
 					speed = float64(delta) / dt
 				}
 
-				fmt.Fprintf(os.Stderr, "\rAttempts: %d | Speed: %.0f/sec | Elapsed: %s", cur, speed, formatDuration(time.Since(startedAt)))
+				etaStr := "--:--:--"
+				if speed > 0 && expectedAttempts > 0 {
+					remaining := expectedAttempts - float64(cur)
+					if remaining < 0 {
+						remaining = 0
+					}
+					etaStr = formatDuration(time.Duration(remaining/speed) * time.Second)
+				}
+
+				if expectedAttempts > 0 {
+					fmt.Fprintf(
+						os.Stderr,
+						"\rAttempts: %d | Speed: %.0f/sec | Elapsed: %s | Expected: ~%.0f | ETA: %s",
+						cur, speed, formatDuration(time.Since(startedAt)), expectedAttempts, etaStr,
+					)
+				} else {
+					fmt.Fprintf(os.Stderr, "\rAttempts: %d | Speed: %.0f/sec | Elapsed: %s", cur, speed, formatDuration(time.Since(startedAt)))
+				}
 				lastAttempts = cur
 				lastAt = now
 			}
@@ -327,7 +698,16 @@ func main() {
 	}()
 
 	for i := 0; i < *walletsToFind; i++ {
-		res := findMatchingWalletConcurrent(m, *cpuCount, quit, &attempts, startedAt)
+		gen := func() (wallet, error) {
+			return generateWallet(), nil
+		}
+		if *useMnemonic {
+			gen = func() (wallet, error) {
+				return generateWalletMnemonic(*mnemonicWords, *derivationPath)
+			}
+		}
+
+		res := findMatchingWalletConcurrent(m, *cpuCount, quit, &attempts, startedAt, gen)
 
 		// Console output: address only.
 		fmt.Println(res.Wallet.Address)
