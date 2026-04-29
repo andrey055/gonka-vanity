@@ -4,11 +4,6 @@ CLI tool for generating Gonka AI vanity wallet addresses locally.
 
 ## Important
 
-**RU**
-- Это **НЕ** онлайн-генератор кошельков.
-- Это локальная утилита: ключи генерируются только на вашем устройстве.
-- Не публикуйте `privkey`, mnemonic phrases и файлы результатов.
-
 **EN**
 - This is **NOT** an online wallet generator.
 - This is a local tool: keys are generated only on your machine.
@@ -198,4 +193,8 @@ Run linters through pre-commit:
 ```bash
 pre-commit run -a
 ```
+
+## Attribution
+
+This project is based on [`hukkin/cosmosvanity`](https://github.com/hukkin/cosmosvanity), originally released under the MIT License.
 
