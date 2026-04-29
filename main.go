@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"runtime"
@@ -469,16 +470,16 @@ func estimateSuccessProbability(m matcher) float64 {
 	return clamp01(1.0 - none)
 }
 
-func writeMatchTXT(f *os.File, res matchResult) error {
+func writeMatchTXT(w io.Writer, res matchResult) error {
 	// NOTE: One line per result (grep-friendly).
 	//
 	// SECURITY WARNING:
-	// - This tool persists private keys. Users MUST protect output files.
+	// - This tool exposes private keys. Users MUST protect output files and terminal logs.
 	// NOTE: Keep fields stable and single-line. Mnemonic-related fields are only present
 	// when mnemonic mode is enabled.
 	if res.Wallet.Mnemonic != "" {
 		_, err := fmt.Fprintf(
-			f,
+			w,
 			"address=%s pubkey=%s privkey=%s mnemonic=%q path=%q matched=%s attempts=%d elapsed=%s\n",
 			res.Wallet.Address,
 			hex.EncodeToString(res.Wallet.Pubkey),
@@ -493,7 +494,7 @@ func writeMatchTXT(f *os.File, res matchResult) error {
 	}
 
 	_, err := fmt.Fprintf(
-		f,
+		w,
 		"address=%s pubkey=%s privkey=%s matched=%s attempts=%d elapsed=%s\n",
 		res.Wallet.Address,
 		hex.EncodeToString(res.Wallet.Pubkey),
@@ -580,11 +581,24 @@ func main() {
 	var repeat = flag.IntP("repeat", "r", 0, "Minimum length of a repeated-character run that the address must contain (e.g. 5 matches aaaaa / 77777 / qqqqq)")
 	var repeatPrefix = flag.Int("repeat-prefix", 0, "Match addresses whose payload starts with N identical characters (e.g. 5 matches aaaaa / 77777 / qqqqq)")
 	var repeatSuffix = flag.Int("repeat-suffix", 0, "Match addresses whose payload ends with N identical characters (e.g. 5 matches aaaaa / 77777 / qqqqq)")
-	var outPath = flag.String("out", "", "Write found wallets to a local file (TXT)")
-	var outFormat = flag.String("format", "txt", "Output format when using --out (txt)")
+	var outPath = flag.String("out", "", "Write full wallet records including private keys to a local TXT file; stdout prints addresses only when set")
+	var outFormat = flag.String("format", "txt", "Output format for --out; only txt is currently supported")
 	var useMnemonic = flag.Bool("mnemonic", false, "Generate wallets from BIP39 mnemonic (slower but wallet-friendly)")
 	var mnemonicWords = flag.Int("words", 24, "Mnemonic word count when using --mnemonic (12 or 24)")
 	var derivationPath = flag.String("path", "m/44'/1200'/0'/0/0", "HD derivation path when using --mnemonic")
+
+	// Keep the built-in flag list, but make the private-key output behavior explicit.
+	// This matters because users must know whether secrets are printed to the terminal
+	// or persisted to a file before starting a long search.
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags]\n\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "Output behavior:")
+		fmt.Fprintln(os.Stderr, "  Without --out: stdout prints full wallet records including private keys.")
+		fmt.Fprintln(os.Stderr, "  With --out: full wallet records are written to the file, while stdout prints addresses only.")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Flags:")
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	if *walletsToFind < 1 {
@@ -649,6 +663,7 @@ func main() {
 
 	// Progress loop: stderr only (keeps stdout clean/pipable).
 	doneProgress := make(chan struct{})
+	var progressPrinted uint32
 	go func() {
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
@@ -687,6 +702,7 @@ func main() {
 				} else {
 					fmt.Fprintf(os.Stderr, "\rAttempts: %d | Speed: %.0f/sec | Elapsed: %s", cur, speed, formatDuration(time.Since(startedAt)))
 				}
+				atomic.StoreUint32(&progressPrinted, 1)
 				lastAttempts = cur
 				lastAt = now
 			}
@@ -709,15 +725,28 @@ func main() {
 
 		res := findMatchingWalletConcurrent(m, *cpuCount, quit, &attempts, startedAt, gen)
 
-		// Console output: address only.
-		fmt.Println(res.Wallet.Address)
+		// Progress is drawn with carriage returns, so finish that line before stdout output.
+		if atomic.LoadUint32(&progressPrinted) == 1 {
+			fmt.Fprintln(os.Stderr)
+			atomic.StoreUint32(&progressPrinted, 0)
+		}
 
-		// File output: full record with matched rule list.
 		if outFile != nil {
+			// Console output stays address-only when full private key records are saved to a file.
+			fmt.Println(res.Wallet.Address)
+
+			// File output: full record with matched rule list.
 			if err := writeMatchTXT(outFile, res); err != nil {
 				fmt.Println("ERROR: Failed to write output file:", err)
 				os.Exit(1)
 			}
+			continue
+		}
+
+		// Without --out, stdout must contain the full record so the private key is not lost.
+		if err := writeMatchTXT(os.Stdout, res); err != nil {
+			fmt.Println("ERROR: Failed to write wallet to stdout:", err)
+			os.Exit(1)
 		}
 	}
 }
